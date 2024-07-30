@@ -1,0 +1,223 @@
+- hosts: localhost
+  become: true
+  vars:
+    postgres_password: 'mypassword'  # Update with your actual password
+    db_name: 'mydatabase'
+    db_user: 'myuser'
+
+  tasks:
+    - name: Create hng user with sudo privileges
+      user:
+        name: hng
+        groups: sudo
+        createhome: yes
+
+    - name: Set hng user password
+      user:
+        name: hng
+        password: "$2b$12$nNN5eRzHYVLdlnlwt2rI2efV3ifkz0SadEyr1cE0CUhEeop3Zp8vW"
+
+    - name: Create /opt/stage_5b directory
+      file:
+        path: /opt/stage_5b
+        state: directory
+        owner: hng
+        group: hng
+
+    - name: Change ownership of /opt/stage_5b to hng
+      file:
+        path: /opt/stage_5b
+        owner: hng
+        group: hng
+
+    - name: Mark /opt/stage_5b as a safe directory for Git
+      command: git config --global --add safe.directory /opt/stage_5b
+      become_user: hng
+
+    - name: Clone the boilerplate repository
+      git:
+        repo: 'https://github.com/hngprojects/hng_boilerplate_python_fastapi_web.git'
+        dest: /opt/stage_5b
+        version: devops
+        force: yes
+        update: yes
+        accept_hostkey: yes
+      become_user: hng
+
+    - name: Update and install dependencies
+      apt:
+        name:
+          - python3-pip
+          - postgresql
+          - nginx
+          - python3-venv
+        state: present
+        update_cache: yes
+
+    - name: Install required Python packages
+      pip:
+        requirements: /opt/stage_5b/requirements.txt
+
+    - name: Ensure PostgreSQL is running
+      service:
+        name: postgresql
+        state: started
+        enabled: true
+
+    - name: Print pg_hba.conf content before modification
+      command: cat /etc/postgresql/14/main/pg_hba.conf
+      register: pg_hba_before
+
+    - debug:
+        var: pg_hba_before.stdout_lines
+
+    - name: Remove any existing md5 authentication line
+      lineinfile:
+        path: /etc/postgresql/14/main/pg_hba.conf
+        state: absent
+        regexp: '^local\s+all\s+all\s+md5$'
+
+    - name: Add PostgreSQL authentication method
+      blockinfile:
+        path: /etc/postgresql/14/main/pg_hba.conf
+        block: |
+          local   all             all                                     md5
+
+    - name: Print pg_hba.conf content after modification
+      command: cat /etc/postgresql/14/main/pg_hba.conf
+      register: pg_hba_after
+
+    - debug:
+        var: pg_hba_after.stdout_lines
+
+    - name: Reload PostgreSQL configuration
+      command: pg_ctlcluster 14 main reload
+
+    - name: Restart PostgreSQL
+      service:
+        name: postgresql
+        state: restarted
+
+    - name: Wait for PostgreSQL to restart
+      wait_for:
+        port: 5432
+        delay: 5
+
+    - name: Set PostgreSQL password for postgres user
+      become: true
+      postgresql_user:
+        name: postgres
+        password: "{{ postgres_password }}"
+        state: present
+
+    - name: Create PostgreSQL database
+      become: true
+      postgresql_db:
+        name: "{{ db_name }}"
+        state: present
+        login_user: postgres
+        login_password: "{{ postgres_password }}"
+
+    - name: Create PostgreSQL user
+      become: true
+      postgresql_user:
+        name: "{{ db_user }}"
+        password: "{{ postgres_password }}"
+        state: present
+        login_user: postgres
+        login_password: "{{ postgres_password }}"
+
+    - name: Grant all privileges on database to user
+      become: true
+      postgresql_privs:
+        db: "{{ db_name }}"
+        role: "{{ db_user }}"
+        privs: ALL
+        type: database
+        grant_option: yes
+        login_user: postgres
+        login_password: "{{ postgres_password }}"
+
+    - name: Create .env.local file with database credentials
+      copy:
+        dest: /opt/stage_5b/.env.local
+        content: |
+          DATABASE_URL=postgresql://{{ db_user }}:{{ postgres_password }}@localhost:5432/{{ db_name }}
+        owner: hng
+        group: hng
+        mode: '0600'
+
+    - name: Install RabbitMQ
+      apt:
+        name: rabbitmq-server
+        state: present
+        update_cache: yes
+
+    - name: Ensure RabbitMQ is running
+      service:
+        name: rabbitmq-server
+        state: started
+        enabled: true
+
+    - name: Create a Python virtual environment
+      command: python3 -m venv /opt/stage_5b/venv
+      become_user: hng
+
+    - name: Install application dependencies
+      pip:
+        requirements: /opt/stage_5b/requirements.txt
+        virtualenv: /opt/stage_5b/venv
+
+    - name: Run the application
+      command: /opt/stage_5b/venv/bin/uvicorn main:app --host 127.0.0.1 --port 3000 --log-config /opt/stage_5b/logging_config.yaml
+      become_user: hng
+
+    - name: Configure Nginx
+      copy:
+        dest: /etc/nginx/sites-available/stage_5b
+        content: |
+          server {
+              listen 80;
+              server_name _;
+
+              location / {
+                  proxy_pass http://127.0.0.1:3000;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+
+    - name: Enable Nginx configuration
+      file:
+        src: /etc/nginx/sites-available/stage_5b
+        dest: /etc/nginx/sites-enabled/stage_5b
+        state: link
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Restart Nginx
+      service:
+        name: nginx
+        state: restarted
+
+    - name: Create log directory
+      file:
+        path: /var/log/stage_5b
+        state: directory
+        owner: hng
+        group: hng
+
+    - name: Configure stderr log
+      lineinfile:
+        path: /opt/stage_5b/logging_config.yaml
+        line: 'stderr: /var/log/stage_5b/error.log'
+
+    - name: Configure stdout log
+      lineinfile:
+        path: /opt/stage_5b/logging_config.yaml
+        line: 'stdout: /var/log/stage_5b/out.log'
